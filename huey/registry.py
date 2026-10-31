@@ -1,77 +1,132 @@
-import pickle
+from collections import namedtuple
 
-from huey.exceptions import QueueException
+from huey.exceptions import HueyException
+from huey.utils import ChordConfig
 
 
-class TaskRegistry(object):
-    """
-    A simple Registry used to track subclasses of :class:`QueueTask` - the
-    purpose of this registry is to allow translation from queue messages to
-    task classes, and vice-versa.
-    """
-    _ignore = ['QueueTask', 'PeriodicQueueTask', 'NewBase']
+Message = namedtuple('Message', ('id', 'name', 'eta', 'retries', 'retry_delay',
+                                 'priority', 'args', 'kwargs', 'on_complete',
+                                 'on_error', 'expires', 'expires_resolved',
+                                 'timeout', 'chord_config', 'retry_backoff'))
 
-    _registry = {}
-    _periodic_tasks = []
+# Automatically set missing parameters to None. This is kind-of a hack, but it
+# allows us to add new parameters while continuing to be able to handle
+# messages enqueued with a smaller-set of arguments.
+Message.__new__.__defaults__ = (None,) * len(Message._fields)
 
-    def task_to_string(self, task):
-        return '%s' % (task.__name__)
+
+class Registry(object):
+    def __init__(self):
+        self._registry = {}
+        self._periodic_tasks = []
+
+    def task_to_string(self, task_class):
+        return '%s.%s' % (task_class.__module__, task_class.__name__)
 
     def register(self, task_class):
-        klass_str = self.task_to_string(task_class)
-        if klass_str in self._ignore:
-            return
+        task_str = self.task_to_string(task_class)
+        if task_str in self._registry:
+            raise ValueError('Attempting to register a task with the same '
+                             'identifier as existing task. Specify a different'
+                             ' name= to register this task. "%s"' % task_str)
 
-        if klass_str not in self._registry:
-            self._registry[klass_str] = task_class
-
-            # store an instance in a separate list of periodic tasks
-            if hasattr(task_class, 'validate_datetime'):
-                self._periodic_tasks.append(task_class())
+        self._registry[task_str] = task_class
+        if hasattr(task_class, 'validate_datetime'):
+            self._periodic_tasks.append(task_class)
+        return True
 
     def unregister(self, task_class):
-        klass_str = self.task_to_string(task_class)
+        task_str = self.task_to_string(task_class)
+        if task_str not in self._registry:
+            return False
 
-        if klass_str in self._registry:
-            del(self._registry[klass_str])
+        del self._registry[task_str]
+        if hasattr(task_class, 'validate_datetime'):
+            self._periodic_tasks = [t for t in self._periodic_tasks
+                                    if t is not task_class]
+        return True
 
-            for task in self._periodic_tasks:
-                if isinstance(task, task_class):
-                    self._periodic_tasks.remove(task)
+    def string_to_task(self, task_str):
+        if task_str not in self._registry:
+            raise HueyException('%s not found in TaskRegistry' % task_str)
+        return self._registry[task_str]
 
-    def __contains__(self, klass_str):
-        return klass_str in self._registry
+    def create_message(self, task):
+        task_str = self.task_to_string(type(task))
+        if task_str not in self._registry:
+            raise HueyException('%s not found in TaskRegistry' % task_str)
 
-    def get_message_for_task(self, task):
-        """Convert a task object to a message for storage in the queue"""
-        return pickle.dumps((
-            task.task_id,
-            self.task_to_string(type(task)),
-            task.execute_time,
+        # Remove an injected context-task instance from the arguments before
+        # serializing. User-provided "task" values are preserved.
+        if task.kwargs and task.kwargs.get('task') is task:
+            task.kwargs.pop('task')
+
+        on_complete = None
+        if task.on_complete is not None:
+            on_complete = self.create_message(task.on_complete)
+
+        on_error = None
+        if task.on_error is not None:
+            on_error = self.create_message(task.on_error)
+
+        chord_config = None
+        if task.chord_config is not None:
+            chord_config = (
+                task.chord_config.cid,
+                task.chord_config.size,
+                task.chord_config.idx,
+                self.create_message(task.chord_config.callback))
+
+        return Message(
+            task.id,
+            task_str,
+            task.eta,
             task.retries,
             task.retry_delay,
-            task.get_data(),
-        ))
+            task.priority,
+            task.args,
+            task.kwargs,
+            on_complete,
+            on_error,
+            task.expires,
+            task.expires_resolved,
+            task.timeout,
+            chord_config,
+            task.retry_backoff)
 
-    def get_task_class(self, klass_str):
-        klass = self._registry.get(klass_str)
+    def create_task(self, message):
+        TaskClass = self.string_to_task(message.name)
 
-        if not klass:
-            raise QueueException('%s not found in TaskRegistry' % klass_str)
+        on_complete = None
+        if message.on_complete is not None:
+            on_complete = self.create_task(message.on_complete)
 
-        return klass
+        on_error = None
+        if message.on_error is not None:
+            on_error = self.create_task(message.on_error)
 
-    def get_task_for_message(self, msg):
-        """Convert a message from the queue into a task"""
-        # parse out the pieces from the enqueued message
-        raw = pickle.loads(msg)
-        task_id, klass_str, execute_time, retries, delay, data = raw
+        chord_config = None
+        if message.chord_config is not None:
+            cid, size, idx, cb_ser = message.chord_config
+            callback = self.create_task(cb_ser)
+            chord_config = ChordConfig(cid, size, idx, callback)
 
-        klass = self.get_task_class(klass_str)
-        return klass(data, task_id, execute_time, retries, delay)
+        return TaskClass(
+            message.args,
+            message.kwargs,
+            message.id,
+            message.eta,
+            message.retries,
+            message.retry_delay,
+            message.priority,
+            message.expires,
+            on_complete,
+            on_error,
+            message.expires_resolved,
+            message.timeout,
+            chord_config,
+            message.retry_backoff)
 
-    def get_periodic_tasks(self):
-        return self._periodic_tasks
-
-
-registry = TaskRegistry()
+    @property
+    def periodic_tasks(self):
+        return [task_class() for task_class in self._periodic_tasks]

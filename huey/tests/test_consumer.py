@@ -1,589 +1,459 @@
-import contextlib
 import datetime
+import os
+import shutil
+import signal
+import sys
+import tempfile
 import threading
 import time
-from functools import wraps
+import unittest
 
-from huey import crontab
+from huey import SqliteHuey
+from huey.api import crontab
 from huey.consumer import Consumer
+from huey.consumer import ConsumerStopped
 from huey.consumer import Scheduler
-from huey.consumer import Worker
-from huey.exceptions import DataStoreTimeout
-from huey.tests.base import b
-from huey.tests.base import BrokenHuey
-from huey.tests.base import CaptureLogs
-from huey.tests.base import HueyTestCase
-from huey.tests.base import test_huey
+from huey.consumer import WORKER_TO_ENVIRONMENT
+from huey.consumer_options import ConsumerConfig
+from huey.consumer_options import OptionParserHandler
+from huey.exceptions import TaskException
+from huey.signals import SIGNAL_COMPLETE
+from huey.signals import SIGNAL_ERROR
+from huey.signals import SIGNAL_INTERRUPTED
+from huey.tests.base import BaseTestCase
+from huey.tests.base import slow_test
 
 
-# Store some global state.
-state = {}
-
-lock = threading.Lock()
-
-# Create some test tasks.
-@test_huey.task()
-def modify_state(k, v):
-    with lock:
-        state[k] = v
-    return v
-
-@test_huey.task()
-def blow_up():
-    raise Exception('blowed up')
-
-@test_huey.task(retries=3)
-def retry_task(k, always_fail=True):
-    if k not in state:
-        if not always_fail:
-            state[k] = 'fixed'
-        raise Exception('fappsk')
-    return state[k]
-
-@test_huey.task(retries=3, retry_delay=10)
-def retry_task_delay(k, always_fail=True):
-    if k not in state:
-        if not always_fail:
-            state[k] = 'fixed'
-        raise Exception('fappsk')
-    return state[k]
-
-@test_huey.periodic_task(crontab(minute='2'))
-def hourly_task():
-    state['p'] = 'y'
+class TestConsumer(Consumer):
+    class _Scheduler(Scheduler):
+        def sleep_for_interval(self, current, interval):
+            pass
+    scheduler_class = _Scheduler
 
 
-class CrashableWorker(Worker):
-    def __init__(self, *args, **kwargs):
-        super(CrashableWorker, self).__init__(*args, **kwargs)
-        self._crash = threading.Event()
-        self._crashed = threading.Event()
+class TestConsumerIntegration(BaseTestCase):
+    consumer_class = TestConsumer
 
-    def crash(self):
-        self._crash.set()
+    def test_consumer_minimal(self):
+        @self.huey.task()
+        def task_a(n):
+            return n + 1
 
-    def crashed(self, blocking=True):
-        if blocking:
-            self._crashed.wait()
-            return True
-        else:
-            return self._crashed.is_set()
+        with self.consumer_context():
+            result = task_a(1)
+            self.assertEqual(result.get(blocking=True, timeout=2), 2)
 
-    def loop(self, now=None):
-        if self._crash.is_set() and not self._crashed.is_set():
-            self._crashed.set()
-            raise KeyboardInterrupt
-        elif self._crashed.is_set():
-            return
-        super(CrashableWorker, self).loop(now=now)
+    def work_on_tasks(self, consumer, n=1, now=None):
+        worker, _ = consumer.worker_threads[0]
+        for i in range(n):
+            self.assertEqual(len(self.huey), n - i)
+            worker.loop(now)
 
+    def schedule_tasks(self, consumer, now=None):
+        scheduler = consumer._create_scheduler()
+        scheduler._next_loop = time.monotonic() + 60
+        scheduler._next_periodic = time.monotonic() - 60
+        scheduler.loop(now)
 
-class CrashableConsumer(Consumer):
-    def _create_worker(self):
-        return CrashableWorker(
-            huey=self.huey,
-            default_delay=self.default_delay,
-            max_delay=self.max_delay,
-            backoff=self.backoff,
-            utc=self.utc)
+    @slow_test()
+    def test_consumer_timeout(self):
+        @self.huey.task(timeout=0.1, context=True)
+        def t(n, task=None):
+            if n:
+                for _ in range(100):
+                    task.check_timeout()
+                    time.sleep(n / 100)
+            return n
 
-    def is_crashed(self, worker=1, blocking=True):
-        worker, _ = self.worker_threads[worker - 1]
-        return worker.crashed(blocking=blocking)
-
-    def crash(self, worker=1):
-        worker, process = self.worker_threads[worker - 1]
-        worker.crash()
-
-
-class ConsumerTestCase(HueyTestCase):
-    def setUp(self):
-        super(ConsumerTestCase, self).setUp()
-        global state
-        state = {}
-
-
-def consumer_test(method):
-    @wraps(method)
-    def inner(self):
-        consumer = self.create_consumer()
-        with CaptureLogs() as capture:
-            consumer.start()
-            try:
-                return method(self, consumer, capture)
-            finally:
-                consumer.stop()
-                for _, worker in consumer.worker_threads:
-                    worker.join()
-    return inner
-
-
-class TestExecution(ConsumerTestCase):
-    def create_consumer(self, worker_type='thread'):
-        consumer = CrashableConsumer(
-            self.huey,
-            max_delay=0.1,
-            workers=2,
-            worker_type=worker_type,
-            health_check_interval=0.01)
-        consumer._stop_flag_timeout = 0.01
-        return consumer
-
-    @consumer_test
-    def test_health_check(self, consumer, capture):
-        modify_state('ka', 'va').get(blocking=True)
-        self.assertEqual(state, {'ka': 'va'})
-
-        consumer.crash(1)
-        self.assertTrue(consumer.is_crashed(1))
-
-        # One worker still alive.
-        modify_state('ka', 'vx').get(blocking=True)
-        self.assertEqual(state, {'ka': 'vx'})
-
-        consumer.crash(2)
-        self.assertTrue(consumer.is_crashed(2))
-
-        self.assertEqual(self.huey.pending_count(), 0)
-        result = modify_state('ka', 'vz')
-
-        wt1, wt2 = consumer.worker_threads
-        w1, w2 = wt1[0], wt2[0]
-        w1.loop()
-        w2.loop()
-        self.assertEqual(self.huey.pending_count(), 1)
-
-        consumer.check_worker_health()
-        result.get(blocking=True)
-        self.assertEqual(state, {'ka': 'vz'})
-
-    @consumer_test
-    def test_worker_health_logging(self, consumer, capture):
-        w1_1 = consumer.worker_threads[0][0]
-        w2_1 = consumer.worker_threads[1][0]
-
-        modify_state('k', '1').get(blocking=True)
-        self.assertEqual(state, {'k': '1'})
-
-        consumer.crash(2)
-        self.assertTrue(consumer.is_crashed(2))
-        self.assertFalse(consumer.is_crashed(1, blocking=False))
-
-        consumer.check_worker_health()
-        self.assertFalse(consumer.is_crashed(2, blocking=False))
-
-        w1_2 = consumer.worker_threads[0][0]
-        w2_2 = consumer.worker_threads[1][0]
-        self.assertTrue(w1_1 is w1_2)
-        self.assertFalse(w1_2 is w2_2)
-
-        task_exec, worker_restart = capture.messages[-2:]
-        self.assertTrue(task_exec.startswith('Executing queuecmd_modify'))
-        self.assertEqual(worker_restart, 'Worker 2 died, restarting.')
-
-    @consumer_test
-    def test_threaded_execution(self, consumer, capture):
-        r1 = modify_state('k1', 'v1')
-        r2 = modify_state('k2', 'v2')
-        r3 = modify_state('k3', 'v3')
-
+        r1 = t(0)
+        r2 = t(0.2)
+        consumer = self.consumer(workers=1)
+        self.work_on_tasks(consumer, 2)
+        self.assertEqual(r1.get(), 0)
+        with self.assertRaises(TaskException):
+            r2.get()
         try:
-            r2.get(blocking=True, timeout=5)
-            r3.get(blocking=True, timeout=5)
-            r1.get(blocking=True, timeout=5)
-        except DataStoreTimeout:
-            assert False, 'Timeout. Consumer/workers running correctly?'
+            r2.get()
+        except TaskException as exc:
+            self.assertEqual(exc.metadata['error'],
+                             'TaskTimeout(\'timeout 0.1s\')')
 
-        self.assertEqual(state, {'k1': 'v1', 'k2': 'v2', 'k3': 'v3'})
+    def test_consumer_schedule_task(self):
+        @self.huey.task()
+        def task_a(n):
+            return n + 1
+
+        now = datetime.datetime.now()
+        eta = now + datetime.timedelta(days=1)
+        r60 = task_a.schedule((2,), delay=60)
+        rday = task_a.schedule((3,), eta=eta)
+
+        consumer = self.consumer(workers=1)
+        self.work_on_tasks(consumer, 2)  # Process the two messages.
+
+        self.assertEqual(len(self.huey), 0)
+        self.assertEqual(self.huey.scheduled_count(), 2)
+
+        self.schedule_tasks(consumer, now)
+        self.assertEqual(len(self.huey), 0)
+        self.assertEqual(self.huey.scheduled_count(), 2)
+
+        # Ensure that the task that had a delay of 60s is read from schedule.
+        later = now + datetime.timedelta(seconds=65)
+        self.schedule_tasks(consumer, later)
+        self.assertEqual(len(self.huey), 1)
+        self.assertEqual(self.huey.scheduled_count(), 1)
+
+        # We can now work on our scheduled task.
+        self.work_on_tasks(consumer, 1, later)
+        self.assertEqual(r60.get(), 3)
+
+        # Verify the task was run and that there is only one task remaining to
+        # be scheduled (in a day).
+        self.assertEqual(len(self.huey), 0)
+        self.assertEqual(self.huey.scheduled_count(), 1)
+
+        tomorrow = now + datetime.timedelta(days=1)
+        self.schedule_tasks(consumer, tomorrow)
+        self.work_on_tasks(consumer, 1, tomorrow)
+        self.assertEqual(rday.get(), 4)
+        self.assertEqual(len(self.huey), 0)
+        self.assertEqual(self.huey.scheduled_count(), 0)
+
+    def test_consumer_periodic_tasks(self):
+        state = []
+
+        @self.huey.periodic_task(crontab(minute='*/10'))
+        def task_p1():
+            state.append('p1')
+
+        @self.huey.periodic_task(crontab(minute='0', hour='0'))
+        def task_p2():
+            state.append('p2')
+
+        consumer = self.consumer(workers=1)
+        dt = datetime.datetime(2000, 1, 1, 0, 0)
+        self.schedule_tasks(consumer, dt)
+        self.assertEqual(len(self.huey), 2)
+        self.work_on_tasks(consumer, 2)
+        self.assertEqual(state, ['p1', 'p2'])
+
+        dt = datetime.datetime(2000, 1, 1, 12, 0)
+        self.schedule_tasks(consumer, dt)
+        self.assertEqual(len(self.huey), 1)
+        self.work_on_tasks(consumer, 1)
+        self.assertEqual(state, ['p1', 'p2', 'p1'])
+
+        task_p1.revoke()
+        self.schedule_tasks(consumer, dt)
+        self.assertEqual(len(self.huey), 1)  # Enqueued despite being revoked.
+        self.work_on_tasks(consumer, 1)
+        self.assertEqual(state, ['p1', 'p2', 'p1'])  # No change, not executed.
+
+    def test_scheduler_periodic_catch_up(self):
+        @self.huey.periodic_task(crontab(minute='*'))
+        def task_p():
+            pass
+
+        consumer = self.consumer(workers=1)
+        scheduler = consumer._create_scheduler()
+        scheduler._next_loop = time.monotonic() + 60
+
+        # Simulate a 5-minute stall (e.g. suspend/resume): the periodic check
+        # timestamp is far in the past. The scheduler skips the missed checks
+        # and fires once for the current minute, rather than running the
+        # back-to-back checks, which would enqueue duplicate tasks.
+        scheduler._next_periodic = time.monotonic() - 300
+        scheduler.loop(datetime.datetime(2000, 1, 1, 0, 0))
+        self.assertEqual(len(self.huey), 1)
+        self.assertTrue(scheduler._next_periodic > time.monotonic())
+
+        # Subsequent iterations do not re-fire for the stalled period.
+        scheduler.loop(datetime.datetime(2000, 1, 1, 0, 0))
+        self.assertEqual(len(self.huey), 1)
+
+    def test_scheduler_periodic_enqueue_error(self):
+        @self.huey.periodic_task(crontab(minute='*'))
+        def task_p():
+            pass
+
+        consumer = self.consumer(workers=1)
+        scheduler = consumer._create_scheduler()
+        scheduler._next_loop = time.monotonic() + 60
+        scheduler._next_periodic = time.monotonic() - 1
+
+        def broken_enqueue(task):
+            raise ValueError('storage down')
+        scheduler.huey.enqueue = broken_enqueue
+
+        # The error is logged and the scheduler keeps running.
+        scheduler.loop(datetime.datetime(2000, 1, 1, 0, 0))
+        self.assertEqual(len(self.huey), 0)
+        self.assertTrue(scheduler._next_periodic > time.monotonic())
 
 
-class TestConsumerAPIs(ConsumerTestCase):
-    def get_periodic_tasks(self):
-        return [hourly_task.task_class()]
+class TestConsumerConfig(BaseTestCase):
+    def test_default_config(self):
+        cfg = ConsumerConfig()
+        cfg.validate()
+        consumer = self.huey.create_consumer(**cfg.values)
+        self.assertEqual(consumer.workers, 1)
+        self.assertEqual(consumer.worker_type, 'thread')
+        self.assertTrue(consumer.periodic)
+        self.assertEqual(consumer.default_delay, 0.1)
+        self.assertEqual(consumer.scheduler_interval, 1)
+        self.assertTrue(consumer._health_check)
 
-    def test_dequeue_errors(self):
-        huey = BrokenHuey()
-        consumer = Consumer(huey, max_delay=0.1, workers=2,
-                            worker_type='thread')
+    def test_consumer_config(self):
+        cfg = ConsumerConfig(workers=3, worker_type='process', initial_delay=1,
+                             backoff=2, max_delay=4, check_worker_health=False,
+                             scheduler_interval=30, periodic=False)
+        cfg.validate()
+        consumer = self.huey.create_consumer(**cfg.values)
 
-        worker = consumer._create_worker()
-        state = {}
+        self.assertEqual(consumer.workers, 3)
+        self.assertEqual(consumer.worker_type, 'process')
+        self.assertFalse(consumer.periodic)
+        self.assertEqual(consumer.default_delay, 1)
+        self.assertEqual(consumer.backoff, 2)
+        self.assertEqual(consumer.max_delay, 4)
+        self.assertEqual(consumer.scheduler_interval, 30)
+        self.assertFalse(consumer._health_check)
+
+    @unittest.skipIf(sys.platform == 'win32', 'requires fork()')
+    def test_process_environment_uses_fork(self):
+        # The worker/scheduler runnables cannot be pickled, so the process
+        # environment must use the fork start-method regardless of the
+        # platform default (spawn on MacOS 3.8+, forkserver on Linux 3.14+).
+        cfg = ConsumerConfig(worker_type='process')
+        cfg.validate()
+        consumer = self.huey.create_consumer(**cfg.values)
+        self.assertEqual(consumer.environment.mp.get_start_method(), 'fork')
+
+    def test_invalid_values(self):
+        def assertInvalid(**kwargs):
+            cfg = ConsumerConfig(**kwargs)
+            self.assertRaises(ValueError, cfg.validate)
+
+        assertInvalid(backoff=0.5)
+        assertInvalid(scheduler_interval=90)
+        assertInvalid(scheduler_interval=7)
+        assertInvalid(scheduler_interval=45)
+        assertInvalid(graceful_signal='HUP')
+
+    def test_shutdown_options(self):
+        cfg = ConsumerConfig(shutdown_timeout=5, graceful_signal='TERM')
+        cfg.validate()
+        consumer = self.huey.create_consumer(**cfg.values)
+        self.assertEqual(consumer.shutdown_timeout, 5)
+        self.assertEqual(consumer.graceful_signal, 'TERM')
+
+        parser = OptionParserHandler().get_option_parser()
+        options, _ = parser.parse_args(['-t', '2.5', '--graceful-signal=TERM'])
+        self.assertEqual(options.shutdown_timeout, 2.5)
+        self.assertEqual(options.graceful_signal, 'TERM')
+
+        consumer = self.huey.create_consumer(**ConsumerConfig().values)
+        self.assertIsNone(consumer.shutdown_timeout)
+        self.assertEqual(consumer.graceful_signal, 'INT')
+
+
+class TestConsumerShutdown(BaseTestCase):
+    def setUp(self):
+        super(TestConsumerShutdown, self).setUp()
+        self._handlers = [(s, signal.getsignal(s))
+                          for s in (signal.SIGINT, signal.SIGTERM)]
+
+    def tearDown(self):
+        for signum, handler in self._handlers:
+            signal.signal(signum, handler)
+        super(TestConsumerShutdown, self).tearDown()
+
+    def test_stop_flag_wait(self):
+        for env_class in WORKER_TO_ENVIRONMENT.values():
+            try:
+                flag = env_class().get_stop_flag()
+            except Exception:
+                continue
+            self.assertFalse(flag.wait(0))
+            flag.set()
+            self.assertTrue(flag.wait(0))
+
+    def test_sleep_wakes_on_stop(self):
+        consumer = self.huey.create_consumer(initial_delay=5, max_delay=5)
+        worker, _ = consumer.worker_threads[0]
+        self.assertIs(worker.stop_flag, consumer.stop_flag)
+
+        threading.Timer(0.05, consumer.stop_flag.set).start()
+        start = time.monotonic()
+        worker.sleep()
+        self.assertLess(time.monotonic() - start, 2)
+
+        start = time.monotonic()
+        worker.sleep_for_interval(start, 5)
+        self.assertLess(time.monotonic() - start, 2)
+
+    def test_shutdown_timeout(self):
+        release = threading.Event()
+        started = threading.Event()
+
+        @self.huey.task()
+        def block():
+            started.set()
+            release.wait()
+
+        block()
+        consumer = self.huey.create_consumer(shutdown_timeout=0.2)
+        consumer.scheduler.start()
+        _, worker_t = consumer.worker_threads[0]
+        worker_t.start()
+        self.assertTrue(started.wait(2))
+
+        start = time.monotonic()
+        with self.assertLogs('huey.consumer', 'WARNING') as logs:
+            consumer.stop(graceful=True)
+        self.assertLess(time.monotonic() - start, 5)
+        self.assertIn('Shutdown timeout', logs.output[0])
+        release.set()
+        worker_t.join(2)
+
+    @slow_test()
+    def test_notify_interrupted_completing_task(self):
+        release = threading.Event()
+        started = threading.Event()
+
+        @self.huey.task()
+        def block():
+            started.set()
+            release.wait(2)  # Hang out in the task after stop-flag set.
+            return 1337
+
+        signals = []
+        @self.huey.signal()
+        def capture(sig, task, *args, **kwargs):
+            signals.append(sig)
+
+        result = block()
+        consumer = self.huey.create_consumer()
+        _, worker_t = consumer.worker_threads[0]
+        worker_t.start()
+        self.assertTrue(started.wait(2))  # Wait for consumer to start task.
+
+        consumer.stop_flag.set()
+        self.huey.notify_interrupted_tasks()  # Task blocked, fire interrupted.
+        release.set()  # Task exits now.
+        worker_t.join(2)
+        self.assertFalse(worker_t.is_alive())
+
+        self.assertEqual(result(), 1337)
+        self.assertIn(SIGNAL_INTERRUPTED, signals)
+        self.assertIn(SIGNAL_COMPLETE, signals)
+        self.assertNotIn(SIGNAL_ERROR, signals)
+
+    @slow_test()
+    def test_notify_interrupted_pop_race(self):
+        release = threading.Event()
+        started = threading.Event()
+        in_pop = threading.Event()
+        resume_pop = threading.Event()
+
+        class PausingSet(set):
+            def pop(self):
+                in_pop.set()
+                resume_pop.wait(2)
+                return set.pop(self)
+        self.huey._tasks_in_flight = PausingSet()
+
+        @self.huey.task()
+        def block():
+            started.set()
+            release.wait(2)
+
+        block()
+        consumer = self.huey.create_consumer()
+        _, worker_t = consumer.worker_threads[0]
+        worker_t.start()
+        self.assertTrue(started.wait(2))  # Like above, wait for task to start.
+        consumer.stop_flag.set()  # Set stop flag on consumer.
+
+        errors = []
+        def notify():
+            try:
+                self.huey.notify_interrupted_tasks()
+            except BaseException as exc:
+                errors.append(exc)
+        notify_t = threading.Thread(target=notify)
+        notify_t.start()
+        self.assertTrue(in_pop.wait(2))  # Wait for notify thread to start.
+        release.set()  # Let task finish.
+        worker_t.join(2)
+        self.assertFalse(worker_t.is_alive())
+        resume_pop.set()  # Now simulate "cleanup" of notifying interrupted.
+        notify_t.join(2)
+        self.assertEqual(errors, [])
+
+    def test_signal_handlers(self):
+        consumer = self.huey.create_consumer()
+        consumer._set_signal_handlers()
+        self.assertEqual(signal.getsignal(signal.SIGINT),
+                         consumer._handle_graceful_signal)
+        self.assertEqual(signal.getsignal(signal.SIGTERM),
+                         consumer._handle_stop_signal)
+
+        consumer = self.huey.create_consumer(graceful_signal='TERM')
+        consumer._set_signal_handlers()
+        self.assertEqual(signal.getsignal(signal.SIGTERM),
+                         consumer._handle_graceful_signal)
+        self.assertEqual(signal.getsignal(signal.SIGINT),
+                         consumer._handle_stop_signal)
+
+        consumer._handle_graceful_signal(signal.SIGTERM, None)
+        self.assertTrue(consumer._graceful)
+        self.assertEqual(consumer._signum, signal.SIGTERM)
+        self.assertEqual(signal.getsignal(signal.SIGTERM),
+                         signal.default_int_handler)
+
+        consumer._handle_stop_signal(signal.SIGINT, None)
+        self.assertFalse(consumer._graceful)
+
+    def test_immediate_stop_ignores_stop_flag(self):
+        # A worker interrupted inside stop_flag.wait() can exit holding the
+        # flag's shared lock, so loop() must not touch the flag after stop().
+        consumer = self.huey.create_consumer()
+        def interrupt_workers():
+            consumer.stop_flag = None
+        consumer._interrupt_workers = interrupt_workers
+        consumer._handle_stop_signal(signal.SIGTERM, None)
+        self.assertRaises(ConsumerStopped, consumer.loop)
+
+
+class TestProcessWorkers(unittest.TestCase):
+    @unittest.skipIf(sys.platform == 'win32', 'requires fork()')
+    @slow_test()
+    def test_process_worker_integration(self):
+        # End-to-end check that tasks execute in forked worker processes,
+        # regardless of the platform's default start-method. Memory storage
+        # cannot be used here (the forked workers would operate on copies),
+        # so run against a sqlite database shared by parent and children.
+        tmp_dir = tempfile.mkdtemp()
+        huey = SqliteHuey('proctest', filename=os.path.join(tmp_dir, 'h.db'))
 
         @huey.task()
-        def modify_broken(k, v):
-            state[k] = v
-
-        with CaptureLogs() as capture:
-            res = modify_broken('k', 'v')
-            worker.loop()
-
-        self.assertEqual(capture.messages, ['Error reading from queue'])
-        self.assertEqual(state, {})
-
-    def test_scheduler_interval(self):
-        consumer = self.get_consumer(scheduler_interval=0.1)
-        self.assertEqual(consumer.scheduler_interval, 1)
-
-        consumer = self.get_consumer(scheduler_interval=120)
-        self.assertEqual(consumer.scheduler_interval, 60)
-
-        consumer = self.get_consumer(scheduler_interval=10)
-        self.assertEqual(consumer.scheduler_interval, 10)
-
-    def test_message_processing(self):
-        worker = self.consumer._create_worker()
-        self.assertEqual(state, {})
-
-        with CaptureLogs() as capture:
-            res = modify_state('k', 'v')
-            worker.loop()
-
-        self.assertLogs(capture, ['Executing %s' % res.task])
-
-        self.assertEqual(state, {'k': 'v'})
-        self.assertEqual(res.get(), 'v')
-
-        self.assertTaskEvents(
-            ('started', res.task),
-            ('finished', res.task))
-
-    def test_worker(self):
-        modify_state('k', 'w')
-        task = test_huey.dequeue()
-        self.worker(task)
-        self.assertEqual(state, {'k': 'w'})
-
-    def test_worker_exception(self):
-        with CaptureLogs() as capture:
-            blow_up()
-            task = test_huey.dequeue()
-
-        # Nothing happens because the task is not executed.
-        self.assertLogs(capture, [])
-
-        with CaptureLogs() as capture:
-            self.worker(task)
-
-        self.assertLogs(capture, [
-            'Executing',
-            'Unhandled exception in worker'])
-
-        self.assertTaskEvents(
-            ('started', task),
-            ('error-task', task))
-
-    def test_retries_and_logging(self):
-        # This will continually fail.
-        retry_task('blampf')
-
-        for i in reversed(range(4)):
-            task = test_huey.dequeue()
-            self.assertEqual(task.retries, i)
-            with CaptureLogs() as capture:
-                self.worker(task)
-
-            if i > 0:
-                self.assertLogs(capture, [
-                    'Executing',
-                    'Unhandled',
-                    'Re-enqueueing'])
-                self.assertTaskEvents(
-                    ('started', task),
-                    ('error-task', task),
-                    ('retrying', task))
-            else:
-                self.assertLogs(capture, [
-                    'Executing',
-                    'Unhandled'])
-                self.assertTaskEvents(
-                    ('started', task),
-                    ('error-task', task))
-
-        self.assertEqual(len(test_huey), 0)
-
-    def test_retries_with_success(self):
-        # this will fail once, then succeed
-        retry_task('blampf', False)
-        self.assertFalse('blampf' in state)
-
-        task = test_huey.dequeue()
-        with CaptureLogs() as capture:
-            self.worker(task)
-
-        self.assertLogs(capture, [
-            'Executing',
-            'Unhandled',
-            'Re-enqueueing'])
-
-        task = test_huey.dequeue()
-        self.assertEqual(task.retries, 2)
-        self.worker(task)
-
-        self.assertEqual(state['blampf'], 'fixed')
-        self.assertEqual(len(test_huey), 0)
-
-        self.assertTaskEvents(
-            ('started', task),
-            ('error-task', task),
-            ('retrying', task),
-            ('started', task),
-            ('finished', task))
-
-    def test_scheduling(self):
-        dt = datetime.datetime(2011, 1, 1, 0, 1)
-        dt2 = datetime.datetime(2037, 1, 1, 0, 1)
-        ad1 = modify_state.schedule(args=('k', 'v'), eta=dt, convert_utc=False)
-        ad2 = modify_state.schedule(args=('k2', 'v2'), eta=dt2, convert_utc=False)
-
-        # Dequeue the past-timestamped task and run it.
-        worker = self.consumer._create_worker()
-        worker.loop()
-
-        self.assertTrue('k' in state)
-
-        # Dequeue the future-timestamped task.
-        worker.loop()
-
-        # Verify the task got stored in the schedule instead of executing.
-        self.assertFalse('k2' in state)
-
-        self.assertTaskEvents(
-            ('started', ad1.task),
-            ('finished', ad1.task),
-            ('scheduled', ad2.task))
-
-        # run through an iteration of the scheduler
-        self.scheduler(dt)
-
-        # our command was not enqueued and no events were emitted.
-        self.assertEqual(len(self.huey), 0)
-
-        # run through an iteration of the scheduler
-        self.scheduler(dt2)
-
-        # our command was enqueued
-        self.assertEqual(len(self.huey), 1)
-
-    def test_retry_scheduling(self):
-        # this will continually fail
-        retry_task_delay('blampf')
-        cur_time = datetime.datetime.utcnow()
-
-        task = self.huey.dequeue()
-
-        with CaptureLogs() as capture:
-            self.worker(task, cur_time)
-
-        self.assertLogs(capture, [
-            'Executing',
-            'Unhandled exception',
-            'Re-enqueueing task',
-            'Adding'])
-
-        in_8 = cur_time + datetime.timedelta(seconds=8)
-        tasks_from_sched = self.huey.read_schedule(in_8)
-        self.assertEqual(tasks_from_sched, [])
-
-        in_11 = cur_time + datetime.timedelta(seconds=11)
-        tasks_from_sched = self.huey.read_schedule(in_11)
-        self.assertEqual(tasks_from_sched, [task])
-
-        task = tasks_from_sched[0]
-        self.assertEqual(task.retries, 2)
-        exec_time = task.execute_time
-
-        self.assertEqual((exec_time - cur_time).seconds, 10)
-        self.assertTaskEvents(
-            ('started', task),
-            ('error-task', task),
-            ('retrying', task),
-            ('scheduled', task))
-
-    def test_revoking_normal(self):
-        # enqueue 2 normal commands
-        r1 = modify_state('k', 'v')
-        r2 = modify_state('k2', 'v2')
-
-        # revoke the first *before it has been checked*
-        r1.revoke()
-        self.assertTrue(test_huey.is_revoked(r1.task))
-        self.assertFalse(test_huey.is_revoked(r2.task))
-
-        # dequeue a *single* message (r1)
-        task = test_huey.dequeue()
-        self.worker(task)
-
-        self.assertTaskEvents(('revoked', r1.task))
-
-        # no changes and the task was not added to the schedule
-        self.assertFalse('k' in state)
-
-        # dequeue a *single* message
-        task = test_huey.dequeue()
-        self.worker(task)
-
-        self.assertTrue('k2' in state)
-
-    def test_revoking_schedule(self):
-        global state
-        dt = datetime.datetime(2011, 1, 1)
-        dt2 = datetime.datetime(2037, 1, 1)
-
-        r1 = modify_state.schedule(args=('k', 'v'), eta=dt, convert_utc=False)
-        r2 = modify_state.schedule(args=('k2', 'v2'), eta=dt, convert_utc=False)
-        r3 = modify_state.schedule(args=('k3', 'v3'), eta=dt2, convert_utc=False)
-        r4 = modify_state.schedule(args=('k4', 'v4'), eta=dt2, convert_utc=False)
-
-        # revoke r1 and r3
-        r1.revoke()
-        r3.revoke()
-        self.assertTrue(test_huey.is_revoked(r1.task))
-        self.assertFalse(test_huey.is_revoked(r2.task))
-        self.assertTrue(test_huey.is_revoked(r3.task))
-        self.assertFalse(test_huey.is_revoked(r4.task))
-
-        expected = [
-            #state,        schedule
-            ({},           0),
-            ({'k2': 'v2'}, 0),
-            ({'k2': 'v2'}, 1),
-            ({'k2': 'v2'}, 2),
-        ]
-
-        for i in range(4):
-            curr_state, curr_sched = expected[i]
-
-            # dequeue a *single* message
-            task = test_huey.dequeue()
-            self.worker(task)
-
-            self.assertEqual(state, curr_state)
-            self.assertEqual(test_huey.scheduled_count(), curr_sched)
-
-        # lets pretend its 2037
-        future = dt2 + datetime.timedelta(seconds=1)
-        self.scheduler(future)
-        self.assertEqual(test_huey.scheduled_count(), 0)
-
-        # There are two tasks in the queue now (r3 and r4) -- process both.
-        for i in range(2):
-            task = test_huey.dequeue()
-            self.worker(task, future)
-
-        self.assertEqual(state, {'k2': 'v2', 'k4': 'v4'})
-
-    def test_periodic_scheduler(self):
-        dt = datetime.datetime(2011, 1, 3, 3, 7)
-        sched = self.scheduler(dt, False)
-        self.assertEqual(sched._counter, 1)
-        self.assertEqual(sched._q, 5)
-        self.assertEqual(len(self.huey), 0)
-
-        dt = datetime.datetime(2011, 1, 1, 0, 2)
-        sched = self.scheduler(dt, True)
-        self.assertEqual(sched._counter, 0)
-        self.assertEqual(sched._q, 5)
-        self.assertEqual(state, {})
-
-        for i in range(len(self.huey)):
-            task = test_huey.dequeue()
-            self.worker(task, dt)
-
-        self.assertEqual(state, {'p': 'y'})
-
-    def test_revoking_periodic(self):
-        global state
-
-        def loop_periodic(ts):
-            self.scheduler(ts, True)
-            for i in range(len(self.huey)):
-                task = test_huey.dequeue()
-                self.worker(task, ts)
-
-        dt = datetime.datetime(2011, 1, 1, 0, 2)
-
-        # revoke the command once
-        hourly_task.revoke(revoke_once=True)
-        self.assertTrue(hourly_task.is_revoked())
-
-        # it will be skipped the first go-round
-        loop_periodic(dt)
-
-        # it has not been run
-        self.assertEqual(state, {})
-
-        # the next go-round it will be enqueued
-        loop_periodic(dt)
-
-        # our command was run
-        self.assertEqual(state, {'p': 'y'})
-
-        # reset state
-        state = {}
-
-        # revoke the command
-        hourly_task.revoke()
-        self.assertTrue(hourly_task.is_revoked())
-
-        # it will no longer be enqueued
-        loop_periodic(dt)
-        loop_periodic(dt)
-        self.assertEqual(state, {})
-
-        # restore
-        hourly_task.restore()
-        self.assertFalse(hourly_task.is_revoked())
-
-        # it will now be enqueued
-        loop_periodic(dt)
-        self.assertEqual(state, {'p': 'y'})
-
-        # reset
-        state = {}
-
-        # revoke for an hour
-        td = datetime.timedelta(seconds=3600)
-        hourly_task.revoke(revoke_until=dt + td)
-
-        loop_periodic(dt)
-        self.assertEqual(state, {})
-
-        # after an hour it is back
-        loop_periodic(dt + td)
-        self.assertEqual(state, {'p': 'y'})
-
-        # our data store should reflect the delay
-        task_obj = hourly_task.task_class()
-        self.assertEqual(test_huey.result_count(), 1)
-        self.assertTrue(test_huey.storage.has_data_for_key(task_obj.revoke_id))
-
-    def test_odd_scheduler_interval(self):
-        self.consumer.stop()
-        self.consumer = self.get_consumer(scheduler_interval=13)
-
-        curr_time = datetime.datetime(2015, 12, 30, 21, 1, 7)
-        scheduler = self.scheduler(curr_time)
-        self.assertEqual(scheduler._counter, 1)
-        self.assertEqual(scheduler._q, 4)
-
-        scheduler.loop(curr_time.replace(second=20))
-        self.assertEqual(scheduler._counter, 2)
-        self.assertEqual(scheduler._q, 4)
-        self.assertEqual(len(self.huey), 0)
-
-        scheduler.loop(curr_time.replace(second=33))
-        self.assertEqual(scheduler._counter, 3)
-        self.assertEqual(scheduler._q, 4)
-        self.assertEqual(len(self.huey), 0)
-
-        scheduler.loop(curr_time.replace(second=46))
-        self.assertEqual(scheduler._counter, 4)
-        self.assertEqual(scheduler._q, 4)
-        self.assertEqual(scheduler._r, 8)
-        self.assertEqual(len(self.huey), 0)
-
-        seconds = (59 + scheduler._r) % 60
-        scheduler.loop(curr_time.replace(minute=2, second=seconds))
-        self.assertEqual(scheduler._counter, 0)
-        self.assertEqual(scheduler._q, 4)
-        self.assertEqual(len(self.huey), 1)
+        def add_pid(a, b):
+            return (a + b, os.getpid())
+
+        huey.pending_count()  # Parent opens a connection before forking.
+        consumer = huey.create_consumer(workers=2, worker_type='process')
+        consumer.start()
+        try:
+            self.assertIsNone(huey.storage._conn)  # Closed before forking.
+            r1, r2 = add_pid(1, 2), add_pid(3, 4)
+            val1, pid1 = r1.get(blocking=True, timeout=10)
+            val2, pid2 = r2.get(blocking=True, timeout=10)
+            self.assertEqual((val1, val2), (3, 7))
+            # The tasks ran in worker processes, not in this process.
+            self.assertNotEqual(pid1, os.getpid())
+            self.assertNotEqual(pid2, os.getpid())
+        finally:
+            consumer.stop(graceful=True)
+            shutil.rmtree(tmp_dir, ignore_errors=True)

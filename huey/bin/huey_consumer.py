@@ -1,9 +1,10 @@
 #!/usr/bin/env python
 
+import logging
 import os
 import sys
 
-from huey.consumer import Consumer
+from huey.constants import WORKER_PROCESS
 from huey.consumer_options import ConsumerConfig
 from huey.consumer_options import OptionParserHandler
 from huey.utils import load_class
@@ -16,7 +17,7 @@ def err(s):
 def load_huey(path):
     try:
         return load_class(path)
-    except:
+    except Exception:
         cur_dir = os.getcwd()
         if cur_dir not in sys.path:
             sys.path.insert(0, cur_dir)
@@ -32,16 +33,25 @@ def consumer_main():
 
     if len(args) == 0:
         err('Error:   missing import path to `Huey` instance')
-        err('Example: huey_consumer.py app.queue.huey_instance')
+        err('Example: huey_consumer app.queue.huey_instance')
         sys.exit(1)
 
-    config = ConsumerConfig(**options.__dict__)
+    options = {k: v for k, v in options.__dict__.items()
+               if v is not None}
+    config = ConsumerConfig(**options)
     config.validate()
 
-    huey_instance = load_huey(args[0])
-    config.setup_logger()
+    if sys.platform == 'win32' and config.worker_type == WORKER_PROCESS:
+        err('Error:  huey cannot be run in "process"-mode on Windows.')
+        sys.exit(1)
 
-    consumer = Consumer(huey_instance, **config.values)
+    huey_instance = load_huey(args[0])
+
+    # Set up logging for the "huey" namespace.
+    logger = logging.getLogger('huey')
+    config.setup_logger(logger)
+
+    consumer = huey_instance.create_consumer(**config.values)
     consumer.run()
 
 
